@@ -6,7 +6,7 @@ type MarkdownNode = {
 };
 
 const BARE_ISSUE_IDENTIFIER_RE = /^[A-Z][A-Z0-9]+-\d+$/i;
-const ISSUE_REFERENCE_TOKEN_RE = /https?:\/\/[^\s<>()]+|(?<![A-Za-z0-9-])[A-Z][A-Z0-9]+-\d+(?!-[A-Za-z0-9])/gi;
+const ISSUE_REFERENCE_TOKEN_RE = /https?:\/\/[^\s<>()]+|(?<![A-Za-z0-9-])[A-Z][A-Z0-9]+-\d+(?!-[A-Za-z0-9])/g;
 
 export function parseIssuePathIdFromPath(pathOrUrl: string | null | undefined): string | null {
   if (!pathOrUrl) return null;

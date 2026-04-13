@@ -39,4 +39,15 @@ describe("issue-reference", () => {
 
     expect(tree.children[0]?.children).toEqual([{ type: "text", value: "dataset ethusdt-linear-1-file-cache" }]);
   });
+
+  it("does not linkify lowercase numeric phrases like low-40s in prose", () => {
+    const tree = {
+      type: "root",
+      children: [{ type: "paragraph", children: [{ type: "text", value: "the low-40s trade frontier" }] }],
+    };
+
+    remarkLinkIssueReferences()(tree as never);
+
+    expect(tree.children[0]?.children).toEqual([{ type: "text", value: "the low-40s trade frontier" }]);
+  });
 });
