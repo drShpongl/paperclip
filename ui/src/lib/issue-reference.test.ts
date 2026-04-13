@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { parseIssuePathIdFromPath, parseIssueReferenceFromHref } from "./issue-reference";
+import { parseIssuePathIdFromPath, parseIssueReferenceFromHref, remarkLinkIssueReferences } from "./issue-reference";
 
 describe("issue-reference", () => {
   it("extracts issue ids from company-scoped issue paths", () => {
@@ -27,5 +27,16 @@ describe("issue-reference", () => {
       issuePathId: "PAP-1271",
       href: "/issues/PAP-1271",
     });
+  });
+
+  it("does not linkify issue-like substrings inside hyphenated dataset names", () => {
+    const tree = {
+      type: "root",
+      children: [{ type: "paragraph", children: [{ type: "text", value: "dataset ethusdt-linear-1-file-cache" }] }],
+    };
+
+    remarkLinkIssueReferences()(tree as never);
+
+    expect(tree.children[0]?.children).toEqual([{ type: "text", value: "dataset ethusdt-linear-1-file-cache" }]);
   });
 });
