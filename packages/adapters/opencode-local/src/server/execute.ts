@@ -50,6 +50,50 @@ function resolveOpenCodeBiller(env: Record<string, string>, provider: string | n
   return inferOpenAiCompatibleBiller(env, null) ?? provider ?? "unknown";
 }
 
+async function hasAncestorFile(startDir: string, fileName: string): Promise<boolean> {
+  let current = path.resolve(startDir);
+  while (true) {
+    try {
+      await fs.access(path.join(current, fileName));
+      return true;
+    } catch {}
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+export async function buildWorkspaceRealityPromptSection(input: {
+  cwd: string;
+  agentHome?: string | null;
+}): Promise<string> {
+  const cwd = input.cwd.trim();
+  if (!cwd) return "";
+
+  const lines = [
+    "## Workspace Reality",
+    "",
+    `- Use this run's actual working directory as ground truth: ${cwd}`,
+    "- Do not substitute generic container roots like `/workspace` or `/app` unless they are explicitly present in this run's filesystem.",
+  ];
+
+  const agentHome = input.agentHome?.trim();
+  if (agentHome) {
+    lines.push(`- Agent home for scratch work is ${agentHome}`);
+  }
+  if (await hasAncestorFile(cwd, "pnpm-workspace.yaml")) {
+    lines.push(
+      "- This workspace uses pnpm workspaces; package contents may resolve through `.pnpm/...` symlinks instead of a flat `node_modules/@scope/pkg` directory.",
+    );
+  }
+  if (await hasAncestorFile(cwd, "tsconfig.json")) {
+    lines.push(
+      "- This workspace contains TypeScript sources; when an import in source code ends with `.js`, check for the sibling `.ts` source file before concluding the file is missing.",
+    );
+  }
+  return lines.join("\n");
+}
+
 function claudeSkillsHome(): string {
   return path.join(os.homedir(), ".claude", "skills");
 }
@@ -282,10 +326,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
     const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
     const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
+    const workspaceRealityPrompt = await buildWorkspaceRealityPromptSection({ cwd, agentHome });
     const prompt = joinPromptSections([
       instructionsPrefix,
       renderedBootstrapPrompt,
       wakePrompt,
+      workspaceRealityPrompt,
       sessionHandoffNote,
       renderedPrompt,
     ]);

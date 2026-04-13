@@ -2100,6 +2100,18 @@ export function agentRoutes(db: Db) {
       return;
     }
 
+    if (req.actor.type === "agent" && req.actor.agentId === id && req.actor.runId) {
+      const activeRun = await heartbeat.getActiveRunForAgent(id);
+      if (activeRun?.id === req.actor.runId) {
+        res.status(409).json({
+          error: "Active heartbeat cannot invoke itself",
+          runId: activeRun.id,
+          status: activeRun.status,
+        });
+        return;
+      }
+    }
+
     const run = await heartbeat.wakeup(id, {
       source: req.body.source,
       triggerDetail: req.body.triggerDetail ?? "manual",
@@ -2148,6 +2160,18 @@ export function agentRoutes(db: Db) {
     if (req.actor.type === "agent" && req.actor.agentId !== id) {
       res.status(403).json({ error: "Agent can only invoke itself" });
       return;
+    }
+
+    if (req.actor.type === "agent" && req.actor.agentId === id && req.actor.runId) {
+      const activeRun = await heartbeat.getActiveRunForAgent(id);
+      if (activeRun?.id === req.actor.runId) {
+        res.status(409).json({
+          error: "Active heartbeat cannot invoke itself",
+          runId: activeRun.id,
+          status: activeRun.status,
+        });
+        return;
+      }
     }
 
     const run = await heartbeat.invoke(
@@ -2443,6 +2467,9 @@ export function agentRoutes(db: Db) {
 
     let run = issue.executionRunId ? await heartbeat.getRunIssueSummary(issue.executionRunId) : null;
     if (run && run.status !== "queued" && run.status !== "running") {
+      run = null;
+    }
+    if (run && issue.assigneeAgentId && run.agentId !== issue.assigneeAgentId) {
       run = null;
     }
 
