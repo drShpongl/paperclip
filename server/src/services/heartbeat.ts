@@ -6,6 +6,7 @@ import { and, asc, desc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import type { BillingType, ExecutionWorkspace, ExecutionWorkspaceConfig } from "@paperclipai/shared";
 import {
+  activityLog,
   agents,
   agentRuntimeState,
   agentTaskSessions,
@@ -2026,6 +2027,59 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  async function warnIfIssueLeftInProgressWithoutUpdate(
+    run: typeof heartbeatRuns.$inferSelect,
+    seq: number,
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId || run.status !== "succeeded") {
+      return seq;
+    }
+
+    const actions = await db
+      .select({ action: activityLog.action })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, run.companyId),
+          eq(activityLog.runId, run.id),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+        ),
+      );
+
+    const actionSet = new Set(actions.map((row) => row.action));
+    if (!actionSet.has("issue.comment_added") || actionSet.has("issue.updated")) {
+      return seq;
+    }
+
+    const currentIssue = await db
+      .select({ identifier: issues.identifier, status: issues.status })
+      .from(issues)
+      .where(and(eq(issues.companyId, run.companyId), eq(issues.id, issueId)))
+      .then((rows) => rows[0] ?? null);
+
+    if (!currentIssue || currentIssue.status !== "in_progress") {
+      return seq;
+    }
+
+    const message = `Run succeeded and added an issue comment, but ${currentIssue.identifier ?? issueId} remained in_progress without issue.updated`;
+    logger.warn({ runId: run.id, issueId, issueIdentifier: currentIssue.identifier ?? null }, message);
+    await appendRunEvent(run, seq++, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message,
+      payload: {
+        issueId,
+        issueIdentifier: currentIssue.identifier ?? null,
+        issueStatus: currentIssue.status,
+      },
+    });
+    return seq;
+  }
+
   async function enqueueMissingIssueCommentRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -3518,6 +3572,7 @@ export function heartbeatService(db: Db) {
         }
         await finalizeIssueCommentPolicy(finalizedRun, agent);
         await releaseIssueExecutionAndPromote(finalizedRun);
+        seq = await warnIfIssueLeftInProgressWithoutUpdate(finalizedRun, seq);
       }
 
       if (finalizedRun) {
