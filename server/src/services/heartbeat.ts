@@ -720,6 +720,8 @@ export function shouldResetTaskSessionForWake(
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
   const triggeredBy = readNonEmptyString(contextSnapshot?.triggeredBy);
+  const workspace = parseObject(contextSnapshot?.paperclipWorkspace);
+  const workspaceSource = readNonEmptyString(workspace?.source);
   if (
     wakeReason === "issue_assigned" ||
     wakeReason === "execution_review_requested" ||
@@ -729,6 +731,9 @@ export function shouldResetTaskSessionForWake(
     return true;
   }
   if (wakeSource === "on_demand" && triggeredBy === "agent") {
+    return true;
+  }
+  if (wakeSource === "timer" && workspaceSource === "task_session") {
     return true;
   }
   return false;
@@ -761,12 +766,17 @@ function describeSessionResetReason(
   const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
   const wakeSource = readNonEmptyString(contextSnapshot?.wakeSource);
   const triggeredBy = readNonEmptyString(contextSnapshot?.triggeredBy);
+  const workspace = parseObject(contextSnapshot?.paperclipWorkspace);
+  const workspaceSource = readNonEmptyString(workspace?.source);
   if (wakeReason === "issue_assigned") return "wake reason is issue_assigned";
   if (wakeReason === "execution_review_requested") return "wake reason is execution_review_requested";
   if (wakeReason === "execution_approval_requested") return "wake reason is execution_approval_requested";
   if (wakeReason === "execution_changes_requested") return "wake reason is execution_changes_requested";
   if (wakeSource === "on_demand" && triggeredBy === "agent") {
     return "agent-triggered on_demand wake requests a fresh session";
+  }
+  if (wakeSource === "timer" && workspaceSource === "task_session") {
+    return "timer wake in task_session workspace requests a fresh session";
   }
   return null;
 }
