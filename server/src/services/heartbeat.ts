@@ -83,6 +83,8 @@ const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
 const MAX_INLINE_WAKE_COMMENT_BODY_CHARS = 4_000;
 const MAX_INLINE_WAKE_COMMENT_BODY_TOTAL_CHARS = 12_000;
+const CHILD_PICKUP_RETRY_THRESHOLD_MS = 60_000;
+const CHILD_PICKUP_PARENT_ESCALATION_THRESHOLD_MS = 180_000;
 const execFile = promisify(execFileCallback);
 const SESSIONED_LOCAL_ADAPTERS = new Set([
   "claude_local",
@@ -2642,6 +2644,195 @@ export function heartbeatService(db: Db) {
     }
   }
 
+  async function enforceDelegatedChildPickupSla(now: Date) {
+    const candidates = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        identifier: issues.identifier,
+        parentId: issues.parentId,
+        assigneeAgentId: issues.assigneeAgentId,
+        updatedAt: issues.updatedAt,
+        createdAt: issues.createdAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          isNull(issues.hiddenAt),
+          eq(issues.status, "todo"),
+          sql`${issues.parentId} is not null`,
+          sql`${issues.assigneeAgentId} is not null`,
+        ),
+      );
+
+    let retried = 0;
+    let escalated = 0;
+
+    for (const child of candidates) {
+      const anchor = new Date(child.updatedAt ?? child.createdAt);
+      const ageMs = now.getTime() - anchor.getTime();
+      if (ageMs < CHILD_PICKUP_RETRY_THRESHOLD_MS) continue;
+
+      const activeOrQueuedRun = await db
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status, startedAt: heartbeatRuns.startedAt, createdAt: heartbeatRuns.createdAt })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, child.companyId),
+            eq(heartbeatRuns.agentId, child.assigneeAgentId!),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${child.id}`,
+            inArray(heartbeatRuns.status, ["queued", "running"]),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (activeOrQueuedRun) continue;
+
+      const recentRun = await db
+        .select({ id: heartbeatRuns.id })
+        .from(heartbeatRuns)
+        .where(
+          and(
+            eq(heartbeatRuns.companyId, child.companyId),
+            eq(heartbeatRuns.agentId, child.assigneeAgentId!),
+            sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${child.id}`,
+            or(
+              gt(heartbeatRuns.createdAt, anchor),
+              gt(heartbeatRuns.startedAt, anchor),
+            ),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (recentRun) continue;
+
+      const queuedWake = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, child.companyId),
+            eq(agentWakeupRequests.agentId, child.assigneeAgentId!),
+            inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution"]),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${child.id}`,
+            sql`${agentWakeupRequests.runId} is null`,
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (queuedWake) continue;
+
+      const existingRetry = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, child.companyId),
+            eq(agentWakeupRequests.agentId, child.assigneeAgentId!),
+            eq(agentWakeupRequests.reason, "child_pickup_retry"),
+            sql`${agentWakeupRequests.payload} ->> 'issueId' = ${child.id}`,
+            gt(agentWakeupRequests.requestedAt, anchor),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+
+      if (!existingRetry) {
+        logger.warn(
+          {
+            childIssueId: child.id,
+            childIdentifier: child.identifier,
+            assigneeAgentId: child.assigneeAgentId,
+            ageMs,
+          },
+          "delegated child issue not picked up within SLA; re-waking assignee",
+        );
+        await enqueueWakeup(child.assigneeAgentId!, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "child_pickup_retry",
+          payload: {
+            issueId: child.id,
+            parentIssueId: child.parentId,
+          },
+          requestedByActorType: "system",
+          requestedByActorId: "child_pickup_sla",
+          contextSnapshot: {
+            issueId: child.id,
+            taskId: child.id,
+            wakeReason: "child_pickup_retry",
+            source: "issue.child_pickup_retry",
+            parentIssueId: child.parentId,
+            childIssueId: child.id,
+            childIdentifier: child.identifier,
+            pickupSlaMissSeconds: Math.floor(ageMs / 1000),
+          },
+        });
+        retried += 1;
+      }
+
+      if (ageMs < CHILD_PICKUP_PARENT_ESCALATION_THRESHOLD_MS) continue;
+
+      const parent = await db
+        .select({ id: issues.id, identifier: issues.identifier, assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+        .from(issues)
+        .where(and(eq(issues.companyId, child.companyId), eq(issues.id, child.parentId!)))
+        .then((rows) => rows[0] ?? null);
+      if (!parent || !parent.assigneeAgentId || ["done", "cancelled"].includes(parent.status)) continue;
+
+      const existingParentEscalation = await db
+        .select({ id: agentWakeupRequests.id })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, child.companyId),
+            eq(agentWakeupRequests.agentId, parent.assigneeAgentId),
+            eq(agentWakeupRequests.reason, "child_not_picked_up"),
+            sql`${agentWakeupRequests.payload} ->> 'childIssueId' = ${child.id}`,
+            gt(agentWakeupRequests.requestedAt, anchor),
+          ),
+        )
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (existingParentEscalation) continue;
+
+      logger.warn(
+        {
+          childIssueId: child.id,
+          childIdentifier: child.identifier,
+          parentIssueId: parent.id,
+          parentIdentifier: parent.identifier,
+          parentAssigneeAgentId: parent.assigneeAgentId,
+          ageMs,
+        },
+        "delegated child issue still not picked up; waking parent assignee",
+      );
+      await enqueueWakeup(parent.assigneeAgentId, {
+        source: "automation",
+        triggerDetail: "system",
+        reason: "child_not_picked_up",
+        payload: {
+          issueId: parent.id,
+          childIssueId: child.id,
+        },
+        requestedByActorType: "system",
+        requestedByActorId: "child_pickup_sla",
+        contextSnapshot: {
+          issueId: parent.id,
+          taskId: parent.id,
+          wakeReason: "child_not_picked_up",
+          source: "issue.child_not_picked_up",
+          childIssueId: child.id,
+          childIdentifier: child.identifier,
+          pickupSlaMissSeconds: Math.floor(ageMs / 1000),
+        },
+      });
+      escalated += 1;
+    }
+
+    return { retried, escalated };
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -4731,7 +4922,9 @@ export function heartbeatService(db: Db) {
         else skipped += 1;
       }
 
-      return { checked, enqueued, skipped };
+      const pickupSla = await enforceDelegatedChildPickupSla(now);
+
+      return { checked, enqueued, skipped, pickupRetried: pickupSla.retried, pickupEscalated: pickupSla.escalated };
     },
 
     cancelRun: (runId: string) => cancelRunInternal(runId),
