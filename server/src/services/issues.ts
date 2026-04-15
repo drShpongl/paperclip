@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -1375,6 +1375,27 @@ export function issueService(db: Db) {
       };
     },
 
+    getWakeableParentForBlockedChild: async (parentIssueId: string) => {
+      const parent = await db
+        .select({
+          id: issues.id,
+          assigneeAgentId: issues.assigneeAgentId,
+          status: issues.status,
+          companyId: issues.companyId,
+        })
+        .from(issues)
+        .where(eq(issues.id, parentIssueId))
+        .then((rows) => rows[0] ?? null);
+      if (!parent || !parent.assigneeAgentId || ["done", "cancelled"].includes(parent.status)) {
+        return null;
+      }
+
+      return {
+        id: parent.id,
+        assigneeAgentId: parent.assigneeAgentId,
+      };
+    },
+
     create: async (
       companyId: string,
       data: IssueCreateInput,
@@ -2048,14 +2069,14 @@ export function issueService(db: Db) {
         if (!anchor) return [];
         conditions.push(
           order === "asc"
-            ? sql<boolean>`(
-                ${issueComments.createdAt} > ${anchor.createdAt}
-                OR (${issueComments.createdAt} = ${anchor.createdAt} AND ${issueComments.id} > ${anchor.id})
-              )`
-            : sql<boolean>`(
-                ${issueComments.createdAt} < ${anchor.createdAt}
-                OR (${issueComments.createdAt} = ${anchor.createdAt} AND ${issueComments.id} < ${anchor.id})
-              )`,
+            ? or(
+                gt(issueComments.createdAt, anchor.createdAt),
+                and(eq(issueComments.createdAt, anchor.createdAt), gt(issueComments.id, anchor.id)),
+              )!
+            : or(
+                lt(issueComments.createdAt, anchor.createdAt),
+                and(eq(issueComments.createdAt, anchor.createdAt), lt(issueComments.id, anchor.id)),
+              )!,
         );
       }
 

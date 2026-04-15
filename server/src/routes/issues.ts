@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
+import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueExecutionDecisions } from "@paperclipai/db";
+import { activityLog, issueExecutionDecisions } from "@paperclipai/db";
 import {
   addIssueCommentSchema,
   createIssueAttachmentMetadataSchema,
@@ -1825,6 +1826,60 @@ export function issueRoutes(
               source: "issue.blockers_resolved",
               resolvedBlockerIssueId: issue.id,
               blockerIssueIds: dependent.blockerIssueIds,
+            },
+          });
+        }
+      }
+
+      const becameBlocked = existing.status !== "blocked" && issue.status === "blocked";
+      if (becameBlocked && issue.parentId) {
+        if (actor.runId) {
+          const parentTouchedBySameRun = await db
+            .select({ id: activityLog.id })
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.companyId, issue.companyId),
+                eq(activityLog.runId, actor.runId),
+                eq(activityLog.entityType, "issue"),
+                eq(activityLog.entityId, issue.parentId),
+              ),
+            )
+            .limit(1)
+            .then((rows) => rows.length > 0);
+
+          if (!parentTouchedBySameRun) {
+            logger.warn(
+              {
+                childIssueId: issue.id,
+                childIdentifier: issue.identifier,
+                parentIssueId: issue.parentId,
+                runId: actor.runId,
+              },
+              "child issue was marked blocked without touching parent issue in the same run",
+            );
+          }
+        }
+
+        const parent = await svc.getWakeableParentForBlockedChild(issue.parentId);
+        if (parent) {
+          addWakeup(parent.assigneeAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "child_blocked",
+            payload: {
+              issueId: parent.id,
+              blockedChildIssueId: issue.id,
+            },
+            requestedByActorType: actor.actorType,
+            requestedByActorId: actor.actorId,
+            contextSnapshot: {
+              issueId: parent.id,
+              taskId: parent.id,
+              wakeReason: "child_blocked",
+              source: "issue.child_blocked",
+              blockedChildIssueId: issue.id,
+              blockedChildIdentifier: issue.identifier,
             },
           });
         }
