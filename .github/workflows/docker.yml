@@ -73,7 +73,7 @@ jobs:
         run: docker rm -f paperclip-ci || true
 
   build-and-push:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
