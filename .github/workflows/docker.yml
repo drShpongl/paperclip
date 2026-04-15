@@ -1,6 +1,9 @@
 name: Docker
 
 on:
+  pull_request:
+    branches:
+      - "master"
   push:
     branches:
       - "master"
@@ -9,15 +12,76 @@ on:
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  verify-image:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: paperclip-ci:${{ github.sha }}
+
+      - name: Start container
+        run: |
+          docker run -d --rm \
+            --name paperclip-ci \
+            -p 3100:3100 \
+            -e BETTER_AUTH_SECRET=test-secret \
+            -e PAPERCLIP_PUBLIC_URL=http://127.0.0.1:3100 \
+            paperclip-ci:${{ github.sha }}
+
+      - name: Wait for health check
+        run: |
+          for _ in $(seq 1 60); do
+            if curl --fail --silent http://127.0.0.1:3100/api/health >/tmp/paperclip-health.json; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Paperclip container did not become healthy"
+          docker logs paperclip-ci
+          exit 1
+
+      - name: Print health response
+        run: cat /tmp/paperclip-health.json
+
+      - name: Print container logs on failure
+        if: failure()
+        run: docker logs paperclip-ci
+
+      - name: Stop test container
+        if: always()
+        run: docker rm -f paperclip-ci || true
+
   build-and-push:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:
       group: docker-${{ github.ref }}
       cancel-in-progress: true
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
